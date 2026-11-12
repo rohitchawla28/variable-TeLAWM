@@ -7,7 +7,7 @@ cudagraphs: true
 buffer_lazy_gather: auto  # [auto, true, false] - auto: on for obs=rgb (gather only the addressed frames instead of full episodes)
 
 # logging
-wandb_project: TeLAWM
+wandb_project: variable-TeLAWM
 wandb_entity: null  # W&B entity (null: your default entity)
 wandb_silent: false
 wandb_name_suffix: ""
