@@ -19,6 +19,7 @@ class TeLAWM(nn.Module):
       - Planning: sample z from the LAM prior, roll out with D for planning_steps steps, and take the subgoal from the
         trajectory with the highest value toward the goal; it is handed to an IQL low-level policy pi(a | s, subgoal).
       - obs=latent trains only the LAM; obs=rgb decodes its latent subgoals for a pixel low level.
+      - With k_conditioned=true, training samples K per pair; planning uses the fixed lam_timescale.
     """
 
     def __init__(self, cfg):
@@ -256,14 +257,14 @@ class TeLAWM(nn.Module):
 
         if self.latent_action_repeat:
             # Sample once from the prior given the initial states, then reuse.
-            out = lam_plan.sample_policy(states)
+            out = lam_plan.sample_policy(states, k=self.lam_timescale)
             latent = out["z"]  # [n_traj, latent_dim]
 
         for t in range(1, horizon + 1):
             if not self.latent_action_repeat:
-                out = lam_plan.sample_policy(states)
+                out = lam_plan.sample_policy(states, k=self.lam_timescale)
                 latent = out["z"]  # [n_traj, latent_dim]
-            states = lam_plan.forward_dynamics(states, latent)  # [n_traj, obs_dim]
+            states = lam_plan.forward_dynamics(states, latent, k=self.lam_timescale)  # [n_traj, obs_dim]
             traj_tensor[t] = states
 
         # traj_tensor shape: [T+1, n_traj, obs_dim]
@@ -351,7 +352,7 @@ class TeLAWM(nn.Module):
     
     def _update_lam(self, batch):
         # Buffer provides lam_next_obs = s_{t+k} (B, obs_dim) for the start state obs = s_t (B, obs_dim)
-        losses = self.lam.losses(batch["obs"], batch["lam_next_obs"])
+        losses = self.lam.losses(batch["obs"], batch["lam_next_obs"], k=batch.get("lam_k"))
 
         self.lam_optimizer.zero_grad()
         losses["lam_loss"].backward()
@@ -359,9 +360,13 @@ class TeLAWM(nn.Module):
         self.lam_optimizer.step()
 
         td = TensorDict(lam_gradnorm=grad_norm)
-        for k in ("lam_loss", "lam_recon", "lam_kl", "lam_mu_mean", "lam_var_mean", "lam_p_mu_mean", "lam_p_var_mean"):
-            if losses.get(k) is not None:
-                td[k] = losses[k].detach()
+        for key in ("lam_loss", "lam_recon", "lam_kl", "lam_mu_mean", "lam_var_mean", "lam_p_mu_mean", "lam_p_var_mean"):
+            if losses.get(key) is not None:
+                td[key] = losses[key].detach()
+        if self.lam.k_conditioned:
+            for k in self.lam.train_k_values:
+                for key in (f"lam_recon_k{k}", f"lam_kl_k{k}", f"lam_count_k{k}"):
+                    td[key] = losses[key].detach()
         return td
     
     def _update_q(self, batch):
@@ -468,6 +473,11 @@ class TeLAWM(nn.Module):
         torch.save({
             "lam": self.lam.state_dict(),
             "lam_timescale": self.lam_timescale,
+            "lam_conditioning": {
+                "k_conditioned": self.lam.k_conditioned,
+                "train_k_values": self.lam.train_k_values,
+                "k_scale": self.lam.k_scale,
+            },
             "vf": self.vf.state_dict(),
             "qfs": self.qnet_params.state_dict(),
             "pi": self.pi.state_dict(),
@@ -483,6 +493,15 @@ class TeLAWM(nn.Module):
             fp (str or Path): checkpoint file.
         """
         state_dict = torch.load(fp)
+        conditioning = state_dict.get("lam_conditioning", {"k_conditioned": False})
+        if conditioning["k_conditioned"] != self.lam.k_conditioned:
+            raise ValueError("telawm.k_conditioned must match the checkpoint")
+        if self.lam.k_conditioned:
+            # Restore the training scale; keep lam_timescale as the requested evaluation K.
+            for lam in (self.lam, self.lam_detach):
+                lam.train_k_values = conditioning["train_k_values"]
+                lam.k_scale = conditioning["k_scale"]
+            self.cfg.telawm["train_k_values"] = conditioning["train_k_values"]
         self.lam.load_state_dict(state_dict["lam"])
         if not self.pretrained_vf:
             self.vf.load_state_dict(state_dict["vf"])
@@ -501,4 +520,3 @@ class TeLAWM(nn.Module):
     @property
     def total_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    

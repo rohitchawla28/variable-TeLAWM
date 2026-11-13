@@ -61,6 +61,10 @@ class Buffer():
 			self._geometric_dist = torch.distributions.Geometric(torch.tensor([1 - self.cfg.gamma], device=self._device))
 		# IQL n-step TD: sample a length-n trajectory window and aggregate into a 1-step batch
 		self.horizon = int(self.cfg.iql['n_step']) if self.cfg.agent == "iql" else 1
+		if self.cfg.agent == "telawm":
+			self.train_k_values = (self.cfg.telawm["train_k_values"] if self.cfg.telawm.get("k_conditioned", False)
+				else [self.cfg.telawm["lam_timescale"]])
+			assert self.train_k_values and all(type(k) is int and 0 < k < cfg.data_episode_length for k in self.train_k_values), "LAM horizons must fit within a sampled episode"
 
 	@property
 	def capacity(self):
@@ -164,11 +168,22 @@ class Buffer():
 		# upper bound for start index: need idxs + max_offset within episode
 		max_offset = self.horizon
 		if self.cfg.agent == "telawm":
-			max_offset = max(max_offset, self.cfg.telawm["lam_timescale"])
+			k_values = torch.tensor(self.train_k_values, device=self._storage_device)
+			if self.cfg.telawm.get("k_conditioned", False):
+				# Draw one independent, uniformly chosen K per batch element.
+				lam_k = k_values[torch.randint(len(k_values), (self.cfg.batch_size,), device=self._storage_device)]
+			else:
+				lam_k = k_values.expand(self.cfg.batch_size)  # Fixed-K mode repeats the single lam_timescale.
+			max_offset = max(max_offset, max(self.train_k_values))
 		if self.cfg.agent in ["acwm", "lacwm"]:
 			agent_cfg = self.cfg.acwm if self.cfg.agent == "acwm" else self.cfg.lacwm
 			max_offset = max(max_offset, self.horizon - 1 + agent_cfg["wm_timescale"])
-		idxs = torch.randint(self.cfg.data_episode_length - max_offset, size=(self.cfg.batch_size,), device=self._storage_device)
+		if self.cfg.agent == "telawm" and self.cfg.telawm.get("k_conditioned", False):
+			# Sample K first, then a valid t for that K; short horizons can use later states.
+			# floor(U * (L - K)) samples t in [0, L - K - 1], so t + K stays inside the episode window.
+			idxs = (torch.rand(self.cfg.batch_size, device=self._storage_device) * (self.cfg.data_episode_length - lam_k)).long()
+		else:
+			idxs = torch.randint(self.cfg.data_episode_length - max_offset, size=(self.cfg.batch_size,), device=self._storage_device)
 		batch_idxs = torch.arange(self.cfg.batch_size, device=self._storage_device).unsqueeze(1)  # shape: (batch_size, 1)
 		slice_idxs = idxs.unsqueeze(1) + torch.arange(self.horizon, device=self._storage_device).unsqueeze(0)
 		# sample policy goal indices
@@ -240,10 +255,12 @@ class Buffer():
 			sd_subgoal_idxs = (slice_idxs + self.cfg.subgoal_k).clamp(max=last_idx)
 			td["sd_next_obs"] = self._obs_at(episodes, batch_idxs, sd_subgoal_idxs)
 
-		# TeLAWM latent action model pairs (s_t, s_{t+k}), k = lam_timescale, with s_t the window's first observation.
+		# Exact TeLAWM pairs: the start-index range already leaves room for each K.
 		if self.cfg.agent == "telawm":
-			lam_idxs = (idxs + self.cfg.telawm["lam_timescale"]).clamp(max=last_idx).unsqueeze(1)
+			lam_idxs = (idxs + lam_k).unsqueeze(1)  # No clamping: the target must be exactly K steps ahead.
 			td["lam_next_obs"] = self._obs_at(episodes, batch_idxs, lam_idxs)  # (batch_size, 1, obs_dim)
+			# Store raw K for conditioning; squeeze(1) below turns [B, 1, 1] into [B, 1].
+			td["lam_k"] = lam_k.to(self._device, non_blocking=True).view(-1, 1, 1)
 
 		# ACWM / LACWM world-model pairs: the action chunk a_{t:t+K-1} and the state s_{t+K} it leads to (K = wm_timescale).
 		# No clamping needed: max_offset leaves K steps after every slice index.
@@ -328,4 +345,3 @@ class Buffer():
 		done = done if self.cfg.done_signal else torch.zeros_like(reward)
 
 		return reward, done
-	

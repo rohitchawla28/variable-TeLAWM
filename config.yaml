@@ -35,6 +35,7 @@ num_video_episodes: 1
 video_frame_skip: 3
 eval_task_ids: [1, 2, 3, 4, 5]  # for ogbench tasks
 render_subgoal_candidates: false
+eval_k_sweep: false  # evaluate each trained K from one checkpoint using seed and the usual evaluation settings
 
 # training
 steps: 1_000_000
@@ -190,6 +191,8 @@ telawm:
   pretrained_policy: false
   policy_chkpt: output/train/path/to/file.pt
   lam_timescale: 50  # k: the LAM learns (s_t, s_{t+k}) -> z and (s, z) -> s'
+  k_conditioned: false  # append K / max(train_k_values) to the posterior, decoder, and prior
+  train_k_values: [10, 25, 50, 100]  # sampled uniformly when k_conditioned; lam_timescale stays fixed at evaluation
   subgoal_steps: 10  # test-time replan interval
   planning_steps: 2  # test-time
   n_sg_samples: 128  # test-time

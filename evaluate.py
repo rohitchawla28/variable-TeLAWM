@@ -6,7 +6,6 @@ os.environ['TORCH_LOGS'] = "+recompiles"
 import warnings
 warnings.filterwarnings('ignore')
 from collections import defaultdict
-from copy import deepcopy
 
 import numpy as np
 import torch
@@ -129,31 +128,43 @@ def evaluate(cfg: dict):
     assert os.path.exists(cfg.eval_checkpoint), f'Checkpoint {cfg.eval_checkpoint} not found! Must be a valid filepath.'
     agent.load(cfg.eval_checkpoint)
 
-    # Evaluate
-    metrics, frames_list = eval_agent(cfg, env, agent)
-    
-    # Logging
-    os.makedirs(cfg.eval_log_dir, exist_ok=True)
-    
-    with open(os.path.join(cfg.eval_log_dir, 'metrics.txt'), "w") as file:
-        file.write(f"Evaluation Metrics\n\n")
-        file.write(f"checkpoint: {cfg.eval_checkpoint}\n")
-        file.write(f"{cfg.eval_variant_name}\n\n")
-        
-        for key, value in metrics.items():
-            data = f"{key}: {value}\n"
-            file.write(data)
-            print(data)
+    if cfg.eval_k_sweep:
+        assert cfg.agent == 'telawm' and agent.lam.k_conditioned, "K sweeps require a K-conditioned Te-LAWM"
+    k_values = agent.lam.train_k_values if cfg.eval_k_sweep else [None]
+    for k in k_values:
+        if k is not None:
+            agent.lam_timescale = k
 
-    print(f'Finished evaluating variant: {cfg.eval_variant_name}\n')
-    
-    if cfg.save_video:
-        frames_array = frames_list_to_array(frames_list, n_cols=len(frames_list))
-        frames_array = np.transpose(frames_array, (0, 2, 3, 1))
-        clip = ImageSequenceClip([frames_array[i] for i in range(len(frames_array))], fps=15)
-        clip.write_videofile(os.path.join(cfg.eval_log_dir, f'eval_video.mp4'))
+            # reset rng to original seed for each eval w/ new K
+            # env local randomness isn't explicitly reset so might not be exactly identical
+            set_seed(cfg.seed)
+        log_dir = os.path.join(cfg.eval_log_dir, f'k{k}') if k is not None else cfg.eval_log_dir
+
+        # Use the original evaluation and video settings for every fixed K.
+        metrics, frames_list = eval_agent(cfg, env, agent)
+        os.makedirs(log_dir, exist_ok=True)
+
+        with open(os.path.join(log_dir, 'metrics.txt'), "w") as file:
+            file.write(f"Evaluation Metrics\n\n")
+            file.write(f"checkpoint: {cfg.eval_checkpoint}\n")
+            file.write(f"seed: {cfg.seed}\n")
+            if cfg.agent == 'telawm':
+                file.write(f"lam_timescale: {agent.lam_timescale}\n")
+            file.write(f"{cfg.eval_variant_name}\n\n")
+
+            for key, value in metrics.items():
+                data = f"{key}: {value}\n"
+                file.write(data)
+                print(data)
+
+        print(f'Finished evaluating variant: {cfg.eval_variant_name}\n')
+
+        if cfg.save_video:
+            frames_array = frames_list_to_array(frames_list, n_cols=len(frames_list))
+            frames_array = np.transpose(frames_array, (0, 2, 3, 1))
+            clip = ImageSequenceClip([frames_array[i] for i in range(len(frames_array))], fps=15)
+            clip.write_videofile(os.path.join(log_dir, 'eval_video.mp4'))
 
 
 if __name__ == '__main__':
     evaluate()
-    
