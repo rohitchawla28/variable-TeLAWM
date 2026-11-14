@@ -13,3 +13,6 @@ datasets/data/
 # Slurm job logs
 slurm/logs/*.out
 slurm/logs/*.err
+
+# Videos and results i want to keep
+saved_results/
