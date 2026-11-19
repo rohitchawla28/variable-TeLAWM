@@ -16,3 +16,5 @@ slurm/logs/*.err
 
 # Videos and results i want to keep
 saved_results/
+
+AGENTS.md
