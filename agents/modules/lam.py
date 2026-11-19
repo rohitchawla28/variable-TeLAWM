@@ -9,6 +9,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class FiLM(nn.Sequential):
+    """Scale and shift hidden features using the normalized horizon."""
+
+    def __init__(self, hidden_dim, feature_dim, device=None):
+        super().__init__(
+            nn.Linear(1, hidden_dim, device=device),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2 * feature_dim, device=device),
+        )
+        # Start with unit scale and zero shift.
+        nn.init.zeros_(self[-1].weight)
+        nn.init.zeros_(self[-1].bias)
+
+    def forward(self, h, k):
+        delta_gamma, beta = super().forward(k).chunk(2, dim=-1)
+        return (1 + delta_gamma) * h + beta
+
+
 class LatentActionModel(nn.Module):
     """
     Latent action model over transitions (s_t, s_{t+K}), K = telawm.lam_timescale, with continuous (Gaussian,
@@ -18,7 +36,7 @@ class LatentActionModel(nn.Module):
       - Decoder (forward dynamics):  D(s_{t+K} | s_t, z_t), used as the planning model
       - Prior over z: N(0, I), or a learned p(z_t | s_t) (learned_prior), used for the KL term during training and
         to sample latent actions at planning time.
-      - With k_conditioned=true, all three networks also receive K / max(train_k_values).
+      - In film and concat modes, all three networks also receive K / max(train_k_values).
     """
 
     def __init__(self, cfg, device=None):
@@ -32,9 +50,14 @@ class LatentActionModel(nn.Module):
         h_dim = cfg.telawm["h_dim"]
 
         #### K (lam timescale) ####
-        self.k_conditioned = cfg.telawm["k_conditioned"]
-        self.train_k_values = list(cfg.telawm["train_k_values"]) if self.k_conditioned else []
-        self.k_scale = float(max(self.train_k_values)) if self.k_conditioned else 1.0
+        self.k_conditioning = cfg.telawm["k_conditioning"]
+        if self.k_conditioning not in ("no", "concat", "film"):
+            raise ValueError(f"Unknown K conditioning: {self.k_conditioning}")
+        self.train_k_values = list(cfg.telawm["train_k_values"]) if self.k_conditioning != "no" else []
+        self.k_scale = float(max(self.train_k_values)) if self.k_conditioning != "no" else 1.0
+
+        # k_input_dim = 0 for film conditioning mode or 1 for "concat" mode
+        k_input_dim = int(self.k_conditioning == "concat")
 
         #### Dimensions ####
         self.obs_dim = cfg.obs_shape[-1]
@@ -42,7 +65,7 @@ class LatentActionModel(nn.Module):
 
         #### Encoder ####
         self.encoder = nn.Sequential(
-            nn.Linear(2 * self.obs_dim + int(self.k_conditioned), h_dim, device=device),
+            nn.Linear(2 * self.obs_dim + k_input_dim, h_dim, device=device),
             nn.GELU(),
             nn.LayerNorm(h_dim, device=device),
             nn.Linear(h_dim, h_dim, device=device),
@@ -59,7 +82,7 @@ class LatentActionModel(nn.Module):
 
         #### Decoder ####
         self.decoder = nn.Sequential(
-            nn.Linear(self.obs_dim + self.latent_action_dim + int(self.k_conditioned), h_dim, device=device),
+            nn.Linear(self.obs_dim + self.latent_action_dim + k_input_dim, h_dim, device=device),
             nn.GELU(),
             nn.LayerNorm(h_dim, device=device),
             nn.Linear(h_dim, h_dim, device=device),
@@ -77,7 +100,7 @@ class LatentActionModel(nn.Module):
         #### Prior ####
         if self.learned_prior:
             self.prior_policy = nn.Sequential(
-                nn.Linear(self.obs_dim + int(self.k_conditioned), h_dim, device=device),
+                nn.Linear(self.obs_dim + k_input_dim, h_dim, device=device),
                 nn.GELU(),
                 nn.LayerNorm(h_dim, device=device),
                 nn.Linear(h_dim, h_dim, device=device),
@@ -92,14 +115,33 @@ class LatentActionModel(nn.Module):
                 nn.Linear(h_dim, 2 * self.latent_action_dim, device=device),
             )
 
-    def _condition(self, x, k):
+        #### FiLM Conditioning for K ####
+        self.encoder_film = self.decoder_film = self.prior_film = None
+        if self.k_conditioning == "film":
+            width = cfg.telawm["film_hidden_dim"]
+            self.encoder_film = FiLM(width, h_dim, device)
+            self.decoder_film = FiLM(width, h_dim, device)
+            if self.learned_prior:
+                self.prior_film = FiLM(width, h_dim, device)
+
+    def _conditioned_forward(self, network, x, k, film):
+        """
+        Wrapper that allows FiLM conditioning for K, concatenation conditioning for K, or not conditioning on K.
+        """
+        
         # The scale is fixed at training time, including when evaluation K changes.
-        if not self.k_conditioned:
-            return x
-        if k is None:
-            raise ValueError("K is required for a K-conditioned LAM")
+        if self.k_conditioning == "no":
+            return network(x)
         k = torch.as_tensor(k, device=x.device, dtype=x.dtype).reshape(-1, 1).expand(x.shape[0], 1)
-        return torch.cat([x, k / self.k_scale], dim=-1)
+        k = k / self.k_scale  # normalize K
+        if film is None:
+            return network(torch.cat([x, k], dim=-1))
+
+        for i, layer in enumerate(network):
+            x = layer(x)
+            if i == 2:  # Modulate once, after the first Linear -> GELU -> LayerNorm block.
+                x = film(x, k)
+        return x
 
     def forward(self, obs: torch.Tensor, next_obs: torch.Tensor, deterministic: bool = False, k=None) -> Dict[str, Any]:
         """
@@ -163,7 +205,7 @@ class LatentActionModel(nn.Module):
             "lam_p_mu_mean": out["p_mu"].mean() if self.learned_prior else None,
             "lam_p_var_mean": torch.exp(out["p_logvar"]).mean() if self.learned_prior else None,
         }
-        if self.k_conditioned:
+        if self.k_conditioning != "no":
             # Accept either one K for the whole batch or one K per pair; both become shape [B].
             k = torch.as_tensor(k, device=obs.device).reshape(-1).expand(obs.shape[0])
             for horizon in self.train_k_values:
@@ -177,21 +219,20 @@ class LatentActionModel(nn.Module):
 
     def inverse_dynamics(self, obs: torch.Tensor, next_obs: torch.Tensor, k=None) -> Dict[str, torch.Tensor]:
         """Posterior q(z | s_t, s_{t+K}): mean and (clamped) log-variance."""
-        # Append K / k_scale to [s_t, s_{t+K}] when conditioning is enabled; otherwise use the original input.
-        h = self.encoder(self._condition(torch.cat([obs, next_obs], dim=-1), k))
+        h = self._conditioned_forward(self.encoder, torch.cat([obs, next_obs], dim=-1), k, self.encoder_film)
         mu, logvar_raw = torch.chunk(h, 2, dim=-1)
         logvar = logvar_raw.clamp(min=-20.0, max=10.0)
         return {"mu": mu, "logvar": logvar}
 
     def forward_dynamics(self, obs: torch.Tensor, latent_action: torch.Tensor, k=None) -> torch.Tensor:
         """D(s_{t+K} | s_t, z_t): the predicted next state."""
-        return self.decoder(self._condition(torch.cat([obs, latent_action], dim=-1), k))
+        return self._conditioned_forward(self.decoder, torch.cat([obs, latent_action], dim=-1), k, self.decoder_film)
 
     def policy(self, obs: torch.Tensor, k=None) -> Dict[str, torch.Tensor]:
         """Learned prior p(z | s_t): mean and (clamped) log-variance; empty without learned_prior."""
         if not self.learned_prior:
             return {}
-        h = self.prior_policy(self._condition(obs, k))
+        h = self._conditioned_forward(self.prior_policy, obs, k, self.prior_film)
         mu, logvar_raw = torch.chunk(h, 2, dim=-1)
         logvar = logvar_raw.clamp(min=-20.0, max=10.0)
         return {"p_mu": mu, "p_logvar": logvar}

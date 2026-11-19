@@ -29,7 +29,7 @@ def config(conditioned=True):
     cfg.reward = 'unsupervised'
     cfg.batch_size, cfg.data_episode_length = 1024, 8
     cfg.arch_mlp['h_dim'] = 16
-    cfg.telawm.update(k_conditioned=conditioned, train_k_values=[2, 4, 7], lam_timescale=2,
+    cfg.telawm.update(k_conditioning="film" if conditioned else "no", train_k_values=[2, 4, 7], lam_timescale=2,
                       h_dim=16, latent_dim=2, n_sg_samples=8, pretrained_vf=True, pretrained_policy=True)
     return cfg
 
@@ -80,8 +80,9 @@ class VariableTimescaleTests(unittest.TestCase):
                         self.assertTrue((counts > cfg.batch_size / len(expected) * 0.75).all())
                         self.assertTrue((start[k == 2, 1] >= 5).any())
 
-    def test_k_reaches_all_networks_and_loss_gradients(self):
+    def test_concat_reaches_all_networks_and_loss_gradients(self):
         cfg = config()
+        cfg.telawm["k_conditioning"] = "concat"
         lam = LatentActionModel(cfg)
         obs, target = torch.randn(6, 2), torch.randn(6, 2)
         k = torch.tensor([2, 4, 7, 2, 4, 7]).view(-1, 1)
@@ -106,9 +107,44 @@ class VariableTimescaleTests(unittest.TestCase):
         scalar_losses = lam.losses(obs, target, k=2)
         self.assertEqual(scalar_losses['lam_count_k2'].item(), len(obs))
 
+    def test_film_starts_as_identity_and_learns_k(self):
+        cfg = config()
+        lam = LatentActionModel(cfg)
+        obs, target, z = torch.randn(3, 2), torch.randn(3, 2), torch.randn(3, 2)
+        k = torch.tensor([2, 4, 7])
+        encoder_input = torch.cat([obs, target], dim=-1)
+        decoder_input = torch.cat([obs, z], dim=-1)
+        q = lam.inverse_dynamics(obs, target, k=k)
+        p = lam.policy(obs, k=k)
+        torch.testing.assert_close(q["mu"], lam.encoder(encoder_input).chunk(2, -1)[0])
+        torch.testing.assert_close(p["p_mu"], lam.prior_policy(obs).chunk(2, -1)[0])
+        torch.testing.assert_close(lam.forward_dynamics(obs, z, k=k), lam.decoder(decoder_input))
+
+        with ExitStack() as stack:
+            heads = (lam.encoder_film, lam.decoder_film, lam.prior_film)
+            calls = [stack.enter_context(patch.object(head, 'forward', wraps=head.forward)) for head in heads]
+            lam.losses(obs, target, k=k)["lam_loss"].backward()
+            for head, forward in zip(heads, calls):
+                torch.testing.assert_close(forward.call_args.args[1], k.float().view(-1, 1) / 7)
+                self.assertGreater(head[-1].weight.grad.abs().sum().item(), 0)
+        torch.optim.Adam(lam.parameters(), lr=cfg.lr).step()
+        for short, long in (
+            (lam.inverse_dynamics(obs, target, k=2)["mu"], lam.inverse_dynamics(obs, target, k=7)["mu"]),
+            (lam.forward_dynamics(obs, z, k=2), lam.forward_dynamics(obs, z, k=7)),
+            (lam.policy(obs, k=2)["p_mu"], lam.policy(obs, k=7)["p_mu"]),
+        ):
+            self.assertFalse(torch.equal(short, long))
+
     def test_checkpoint_planning_and_frozen_iql(self):
+        for mode in ("film", "concat"):
+            with self.subTest(mode=mode):
+                self.check_checkpoint_planning_and_frozen_iql(mode)
+
+    def check_checkpoint_planning_and_frozen_iql(self, mode):
         with TemporaryDirectory() as directory:
-            agent = cpu_agent(config(), directory)
+            cfg = config()
+            cfg.telawm["k_conditioning"] = mode
+            agent = cpu_agent(cfg, directory)
             frozen = {name: {key: value.detach().clone() for key, value in getattr(agent, name).named_parameters()}
                       for name in ('pi', 'vf', 'qnet_params')}
             batch = TensorDict(dict(obs=torch.randn(6, 2), lam_next_obs=torch.randn(6, 2),
@@ -119,7 +155,16 @@ class VariableTimescaleTests(unittest.TestCase):
                     torch.testing.assert_close(dict(getattr(agent, name).named_parameters())[key], value, rtol=0, atol=0)
             checkpoint = Path(directory) / 'latest.pt'
             agent.save(checkpoint)
+            if mode == "concat":
+                # Older multi-K checkpoints did not record a conditioning architecture.
+                state = torch.load(checkpoint)
+                state["lam_conditioning"]["k_conditioned"] = True
+                del state["lam_conditioning"]["k_conditioning"], state["lam_conditioning"]["film_hidden_dim"]
+                torch.save(state, checkpoint)
+                with self.assertRaisesRegex(ValueError, "k_conditioning"):
+                    cpu_agent(config(), directory).load(checkpoint)
             cfg = config()
+            cfg.telawm["k_conditioning"] = mode
             cfg.telawm['train_k_values'] = [1, 100]  # loading must restore the original scale and supported K
             restored = cpu_agent(cfg, directory)
             restored.load(checkpoint)
@@ -139,6 +184,28 @@ class VariableTimescaleTests(unittest.TestCase):
                     self.assertTrue(all(call.kwargs['k'] == k for call in prior.call_args_list + decoder.call_args_list))
             torch.testing.assert_close(restored.lam(obs, goal, True, 2)['next_obs_pred'],
                                        agent.lam(obs, goal, True, k=2)['next_obs_pred'])
+
+    def test_legacy_two_setting_checkpoints(self):
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'legacy.pt'
+            for mode in ("no", "film"):
+                with self.subTest(mode=mode):
+                    cfg = config(conditioned=(mode != "no"))
+                    agent = cpu_agent(cfg, directory)
+                    agent.save(checkpoint)
+                    state = torch.load(checkpoint)
+                    # The old config could name FiLM even when its switch disabled K.
+                    state["lam_conditioning"].update(k_conditioned=(mode != "no"), k_conditioning="film")
+                    torch.save(state, checkpoint)
+                    restored = cpu_agent(cfg, directory)
+                    restored.load(checkpoint)
+                    obs = torch.randn(3, 2)
+                    torch.testing.assert_close(restored.lam(obs, obs, True, k=2)["next_obs_pred"],
+                                               agent.lam(obs, obs, True, k=2)["next_obs_pred"])
+                    if mode == "film":
+                        cfg.telawm["film_hidden_dim"] += 1
+                        with self.assertRaisesRegex(ValueError, "film_hidden_dim"):
+                            cpu_agent(cfg, directory).load(checkpoint)
 
     def test_original_checkpoint_without_conditioning_metadata(self):
         with TemporaryDirectory() as directory:
@@ -171,7 +238,7 @@ class EvaluationSweepTests(unittest.TestCase):
             cfg.eval_k_sweep = True
             cfg.num_eval_episodes, cfg.num_video_episodes = 3, 1
             cfg.save_video = True
-            agent = SimpleNamespace(lam=SimpleNamespace(k_conditioned=True, train_k_values=[2, 4, 7]), load=Mock())
+            agent = SimpleNamespace(lam=SimpleNamespace(k_conditioning="film", train_k_values=[2, 4, 7]), load=Mock())
             calls = []
 
             def rollout(eval_cfg, env, current_agent):

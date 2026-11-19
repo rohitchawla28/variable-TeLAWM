@@ -129,7 +129,7 @@ def evaluate(cfg: dict):
     agent.load(cfg.eval_checkpoint)
 
     if cfg.eval_k_sweep:
-        assert cfg.agent == 'telawm' and agent.lam.k_conditioned, "K sweeps require a K-conditioned Te-LAWM"
+        assert cfg.agent == 'telawm' and agent.lam.k_conditioning != "no", "K sweeps require a K-conditioned Te-LAWM"
     k_values = agent.lam.train_k_values if cfg.eval_k_sweep else [None]
     for k in k_values:
         if k is not None:

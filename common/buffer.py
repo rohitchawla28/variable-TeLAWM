@@ -62,7 +62,7 @@ class Buffer():
 		# IQL n-step TD: sample a length-n trajectory window and aggregate into a 1-step batch
 		self.horizon = int(self.cfg.iql['n_step']) if self.cfg.agent == "iql" else 1
 		if self.cfg.agent == "telawm":
-			self.train_k_values = (self.cfg.telawm["train_k_values"] if self.cfg.telawm.get("k_conditioned", False)
+			self.train_k_values = (self.cfg.telawm["train_k_values"] if self.cfg.telawm["k_conditioning"] != "no"
 				else [self.cfg.telawm["lam_timescale"]])
 			assert self.train_k_values and all(type(k) is int and 0 < k < cfg.data_episode_length for k in self.train_k_values), "LAM horizons must fit within a sampled episode"
 
@@ -169,7 +169,7 @@ class Buffer():
 		max_offset = self.horizon
 		if self.cfg.agent == "telawm":
 			k_values = torch.tensor(self.train_k_values, device=self._storage_device)
-			if self.cfg.telawm.get("k_conditioned", False):
+			if self.cfg.telawm["k_conditioning"] != "no":
 				# Draw one independent, uniformly chosen K per batch element.
 				lam_k = k_values[torch.randint(len(k_values), (self.cfg.batch_size,), device=self._storage_device)]
 			else:
@@ -178,7 +178,7 @@ class Buffer():
 		if self.cfg.agent in ["acwm", "lacwm"]:
 			agent_cfg = self.cfg.acwm if self.cfg.agent == "acwm" else self.cfg.lacwm
 			max_offset = max(max_offset, self.horizon - 1 + agent_cfg["wm_timescale"])
-		if self.cfg.agent == "telawm" and self.cfg.telawm.get("k_conditioned", False):
+		if self.cfg.agent == "telawm" and self.cfg.telawm["k_conditioning"] != "no":
 			# Sample K first, then a valid t for that K; short horizons can use later states.
 			# floor(U * (L - K)) samples t in [0, L - K - 1], so t + K stays inside the episode window.
 			idxs = (torch.rand(self.cfg.batch_size, device=self._storage_device) * (self.cfg.data_episode_length - lam_k)).long()

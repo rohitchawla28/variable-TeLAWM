@@ -20,7 +20,7 @@ IQL_RUN_SUFFIX=baseline
 IQL_CHECKPOINT=output/train/iql_pointmaze-medium-navigate-v0_${IQL_SEED}_${IQL_RUN_SUFFIX}/models/latest.pt
 
 python -u train.py \
-    task=pointmaze-medium-navigate-v0 obs=state agent=telawm \
+    task=pointmaze-medium-navigate-v0 obs=state agent=telawm telawm.k_conditioning=no \
     seed=0 gamma=0.99 steps=1001000 \
     compile=false cudagraphs=false \
     run_suffix=fixedk25 wandb_name_suffix=_fixedk25 \
@@ -37,7 +37,7 @@ TELAWM_RUN_SUFFIX=fixedk25
 TELAWM_CHECKPOINT=output/train/telawm_pointmaze-medium-navigate-v0_${TELAWM_SEED}_${TELAWM_RUN_SUFFIX}/models/latest.pt
 
 python -u evaluate.py \
-    task=pointmaze-medium-navigate-v0 obs=state agent=telawm \
+    task=pointmaze-medium-navigate-v0 obs=state agent=telawm telawm.k_conditioning=no \
     seed=0 gamma=0.99 compile=false cudagraphs=false \
     run_suffix=fixedk25 "eval_checkpoint=$TELAWM_CHECKPOINT" \
     'eval_task_ids=[1,2,3,4,5]' num_eval_episodes=20 \
